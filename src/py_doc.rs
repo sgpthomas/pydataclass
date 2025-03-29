@@ -17,6 +17,9 @@ pub(super) trait PrettyExt<'a>: Sized {
     fn parens(self) -> RcDoc<'a> {
         self.enclose("(", ")")
     }
+    fn braces(self) -> RcDoc<'a> {
+        self.enclose("{", "}")
+    }
     fn brackets(self) -> RcDoc<'a> {
         self.enclose("[", "]")
     }
@@ -198,6 +201,11 @@ impl<'a> PyFnDoc<'a> {
 
     pub fn body(mut self, body: RcDoc<'a>) -> Self {
         self.body = Some(body);
+        self
+    }
+
+    pub fn override_name(mut self, name: &'a str) -> Self {
+        self.name = name;
         self
     }
 }

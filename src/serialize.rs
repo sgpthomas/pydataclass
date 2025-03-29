@@ -14,6 +14,7 @@ use crate::{
 /// Describes how to build the parse function for `Self`
 trait ParseFunction<'a> {
     fn parse(self, ctx: &mut Context) -> PyFnDoc<'a>;
+    fn dump(self, ctx: &mut Context) -> PyFnDoc<'a>;
 }
 
 /// Describes how to render self to a RcDoc
@@ -23,20 +24,12 @@ pub(super) trait Render<'a>: Sized {
 
 #[derive(Default)]
 pub(super) struct Context {
-    top_level: String,
     ty_imports: BTreeMap<String, HashSet<String>>,
     seen_definitions: HashSet<String>,
     dependencies: HashSet<String>,
 }
 
 impl Context {
-    fn new(top_level: impl ToString) -> Self {
-        Self {
-            top_level: top_level.to_string(),
-            ..Default::default()
-        }
-    }
-
     fn import(&mut self, module: impl ToString, thing: impl ToString) {
         match self.ty_imports.entry(module.to_string()) {
             Entry::Occupied(mut o) => {
@@ -48,15 +41,8 @@ impl Context {
         }
     }
 
-    fn render_parse_fields<'a>(&mut self, name: &str, fields: &'a Fields) -> RcDoc<'a> {
-        let top_level = self.top_level.clone();
-        let input = move |doc: RcDoc<'a>| {
-            if name == top_level {
-                RcDoc::text("input")
-            } else {
-                RcDoc::text("input").append(doc.brackets())
-            }
-        };
+    fn render_parse_fields<'a>(&mut self, fields: &'a Fields) -> RcDoc<'a> {
+        let input = move |doc: RcDoc<'a>| RcDoc::text("input").append(doc.brackets());
         match fields {
             Fields::Named(fields) => RcDoc::intersperse(
                 fields.iter().map(|f| {
@@ -79,13 +65,13 @@ impl Context {
 
     fn construct_py_type<'a>(&mut self, ty: &'a PyType, doc: RcDoc<'a>) -> RcDoc<'a> {
         match ty {
-            PyType::Container("List", args) if args.len() == 1 => RcDoc::text("[")
+            PyType::Container("List", args) if args.len() == 1 => RcDoc::nil()
                 .append(self.construct_py_type(&args[0], RcDoc::text("item")))
                 .append(RcDoc::space())
                 .append("for item in")
                 .append(RcDoc::space())
                 .append(doc)
-                .append("]"),
+                .brackets(),
             PyType::Container("Optional", args) if args.len() == 1 => self
                 .construct_py_type(&args[0], doc.clone())
                 .append(RcDoc::space())
@@ -106,6 +92,31 @@ impl Context {
                 RcDoc::text("cast").append(RcDoc::text(*pyty).append(", ").append(doc).parens())
             }
             PyType::Named(name) => RcDoc::text(name).append(".parse").append(doc.parens()),
+        }
+    }
+
+    #[allow(clippy::only_used_in_recursion)]
+    fn dump_py_type<'a>(&self, ty: &'a PyType, doc: RcDoc<'a>) -> RcDoc<'a> {
+        match ty {
+            PyType::Container("List", args) if args.len() == 1 => RcDoc::nil()
+                .append("x.dump() for x in self.")
+                .append(doc)
+                .brackets(),
+            PyType::Container("Optional", _) => RcDoc::text("self.").append(doc),
+            PyType::Container("Tuple", args) => RcDoc::intersperse(
+                args.iter().enumerate().map(|(i, a)| {
+                    self.dump_py_type(a, doc.clone())
+                        .append(RcDoc::text(format!("{i}")).brackets())
+                }),
+                ", ",
+            )
+            .parens(),
+            PyType::Container(ty, args) => panic!("Don't support {ty}[{args:?}] yet"),
+            PyType::BuiltIn("Path") => {
+                RcDoc::text("str").append(RcDoc::text("self.").append(doc).parens())
+            }
+            PyType::BuiltIn(_) => RcDoc::text("self.").append(doc),
+            PyType::Named(_) => RcDoc::text("self.").append(doc).append(".dump()"),
         }
     }
 }
@@ -138,7 +149,7 @@ impl<'a> ParseFunction<'a> for (&'a str, &'a Fields) {
                     .append(RcDoc::space())
                     .append(expected_type)
                     .append(RcDoc::hardline())
-                    .append(ctx.render_parse_fields(name, fields))
+                    .append(ctx.render_parse_fields(fields))
                     .append(RcDoc::hardline())
                     .append("return")
                     .append(RcDoc::space())
@@ -147,6 +158,35 @@ impl<'a> ParseFunction<'a> for (&'a str, &'a Fields) {
                         RcDoc::intersperse(field_names(fields).map(|(name, _)| name), ", ")
                             .parens(),
                     ),
+            )
+    }
+
+    fn dump(self, ctx: &mut Context) -> PyFnDoc<'a> {
+        let (_name, fields) = self;
+        PyFnDoc::new("dump")
+            .arg("self")
+            .returns(RcDoc::text("Json"))
+            .body(
+                RcDoc::nil().append("return").append(RcDoc::space()).append(
+                    RcDoc::nil()
+                        .append(
+                            RcDoc::hardline()
+                                .append(RcDoc::intersperse(
+                                    field_names(fields).map(|(field_name, field_ty)| {
+                                        field_name
+                                            .clone()
+                                            .double_quotes()
+                                            .append(": ")
+                                            .append(ctx.dump_py_type(field_ty, field_name))
+                                    }),
+                                    RcDoc::text(",").append(RcDoc::hardline()),
+                                ))
+                                .nest(4)
+                                .group(),
+                        )
+                        .append(RcDoc::hardline())
+                        .braces(),
+                ),
             )
     }
 }
@@ -167,13 +207,18 @@ impl<'a> ParseFunction<'a> for &'a PyDataclass {
     fn parse(self, ctx: &mut Context) -> PyFnDoc<'a> {
         (self.name.as_str(), &self.fields).parse(ctx)
     }
+
+    fn dump(self, ctx: &mut Context) -> PyFnDoc<'a> {
+        (self.name.as_str(), &self.fields).dump(ctx)
+    }
 }
 
 impl<'a> Render<'a> for &'a PyDataclass {
     fn render(self, ctx: &mut Context) -> RcDoc<'a> {
         let mut cls = PyClassDoc::new(&self.name)
             .annotate("@dataclass")
-            .function(self.parse(ctx));
+            .function(self.parse(ctx))
+            .function(self.dump(ctx));
         cls = match &self.fields {
             Fields::Named(named) => cls.fields(
                 named
@@ -233,6 +278,7 @@ impl<'a> Render<'a> for &'a PyEnum {
     fn render(self, ctx: &mut Context) -> RcDoc<'a> {
         PyClassDoc::new(&self.name)
             .function(self.parse(ctx))
+            .function(self.dump(ctx))
             .render(ctx)
             .append(RcDoc::hardline())
             .append(RcDoc::hardline())
@@ -273,6 +319,11 @@ impl<'a> Render<'a> for &'a PyEnum {
                         cls = cls
                             .function(init_fn)
                             .function((v.name.as_str(), fields).parse(ctx))
+                            .function(
+                                (v.name.as_str(), fields)
+                                    .dump(ctx)
+                                    .override_name("dump_inner"),
+                            )
                     }
                     cls.render(ctx)
                 }),
@@ -380,6 +431,30 @@ impl<'a> ParseFunction<'a> for &'a PyEnum {
                     .render(ctx),
             )
     }
+
+    fn dump(self, ctx: &mut Context) -> PyFnDoc<'a> {
+        PyFnDoc::new("dump")
+            .arg("self")
+            .returns(RcDoc::text("Json"))
+            .body(
+                self.variants
+                    .iter()
+                    .map(|v| {
+                        let vname = &v.name;
+                        match &v.fields {
+                            Some(_) => PyStmtDoc::if_(format!("isinstance(self, {vname})",))
+                                .then(format!("return {{\"{vname}\": self.dump_inner()}}")),
+                            None => PyStmtDoc::if_(format!(
+                                "type(input) is str and \"{vname}\" == input"
+                            ))
+                            .then(format!("return {vname}()")),
+                        }
+                    })
+                    .collect::<PyStmtDoc>()
+                    .else_("raise Exception(\"unreachable\")")
+                    .render(ctx),
+            )
+    }
 }
 
 impl<'a> Render<'a> for &'a Vec<Variant> {
@@ -418,7 +493,7 @@ where
         let mut registry = PyRegistry::default();
         let root_class = T::py_class(&mut registry);
 
-        let mut ctx = Context::new(root_class.name());
+        let mut ctx = Context::default();
         let mut rendered_py_classes: Vec<u8> = vec![];
         root_class
             .render(&mut ctx)
