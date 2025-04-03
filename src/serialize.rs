@@ -533,3 +533,59 @@ where
         Ok(())
     }
 }
+
+impl<A, B> std::fmt::Display for Serializer<(A, B)>
+where
+    A: BuildPyClass,
+    B: BuildPyClass,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut registry = PyRegistry::default();
+        let root_class_a = A::py_class(&mut registry);
+        let root_class_b = B::py_class(&mut registry);
+
+        let mut ctx = Context::default();
+        let mut rendered_py_classes: Vec<u8> = vec![];
+        root_class_a
+            .render(&mut ctx)
+            .render(80, &mut rendered_py_classes)
+            .unwrap();
+        writeln!(&mut rendered_py_classes, "\n\n").unwrap();
+        root_class_b
+            .render(&mut ctx)
+            .render(80, &mut rendered_py_classes)
+            .unwrap();
+
+        writeln!(&mut rendered_py_classes, "\n\n").unwrap();
+
+        for v in registry.0.into_values().flatten() {
+            v.render(&mut ctx)
+                .render(80, &mut rendered_py_classes)
+                .unwrap();
+            writeln!(&mut rendered_py_classes, "\n\n").unwrap();
+        }
+
+        ctx.import("dataclasses", "dataclass");
+        ctx.import("typing", "List");
+        ctx.import("typing", "Dict");
+        for (module, imports) in &ctx.ty_imports {
+            writeln!(
+                f,
+                "from {module} import {}",
+                imports.iter().cloned().collect::<Vec<_>>().join(", ")
+            )?;
+        }
+
+        writeln!(f)?;
+        writeln!(f, "Json = List[\"Json\"] | Dict | str | int")?;
+        writeln!(f)?;
+
+        write!(
+            f,
+            "\n{}",
+            String::from_utf8(rendered_py_classes).unwrap().trim_end()
+        )?;
+
+        Ok(())
+    }
+}
